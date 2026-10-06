@@ -1,4 +1,4 @@
-import os, sqlite3, json, uuid, secrets, socket, subprocess, time
+import os, sqlite3, json, uuid, secrets, socket, subprocess, time, shutil
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, session, send_from_directory, render_template, abort, send_file
@@ -49,17 +49,31 @@ def regenerate():
   proto=x['protocol'].lower(); settings={};
   if proto in ('vless','vmess'): settings={'clients':[{'id':x['uuid'],'email':x['name']}],'decryption':'none'} if proto=='vless' else {'clients':[{'id':x['uuid'],'email':x['name']}],'decryption':'none'}
   elif proto=='trojan': settings={'clients':[{'password':x['uuid'],'email':x['name']}],'fallbacks':[]}
-  elif proto=='shadowsocks': settings={'clients':[{'password':x['uuid'],'email':x['name']}],'method':'2022-blake3-aes-128-gcm'}
+  elif proto=='shadowsocks': settings={'clients':[{'password':x['uuid'],'email':x['name']}],'method':'aes-128-gcm'}
   else: settings={'clients':[{'password':x['uuid'],'email':x['name']}]}
   stream={'network': {'httpupgrade':'httpupgrade','xhttp':'xhttp'}.get(x['transport'].lower(),x['transport'].lower()),'security':'none'}
   if stream['network'] in ('ws','httpupgrade','xhttp'): stream['sockopt']={'tcpFastOpen':True}
   inbound={'tag':'titan-'+str(x['id']),'port':int(os.environ.get('XRAY_PORT','10000')),'listen':'127.0.0.1','protocol':proto,'settings':settings,'streamSettings':stream}
-  if stream['network'] in ('ws','httpupgrade','xhttp'): stream['wsSettings']={'path':'/xray/'+str(x['id'])}
+  if stream['network']=='ws': stream['wsSettings']={'path':'/xray/'+str(x['id']),'headers':{'Host':x.get('domain') or ''}}
+  elif stream['network']=='grpc': stream['grpcSettings']={'serviceName':x.get('service_name') or 'titan'}
+  elif stream['network']=='httpupgrade': stream['httpupgradeSettings']={'path':'/xray/'+str(x['id']),'host':x.get('domain') or ''}
+  elif stream['network']=='xhttp': stream['xhttpSettings']={'path':'/xray/'+str(x['id']),'mode':'auto'}
   inbounds.append(inbound)
  cfg={'log':{'loglevel':'warning'},'inbounds':inbounds,'outbounds':[{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}]}
  path=os.path.join(XRAY_DIR,'config.json'); open(path,'w').write(json.dumps(cfg,ensure_ascii=False,indent=2));
  domain=os.environ.get('RAILWAY_PUBLIC_DOMAIN',''); public_port=os.environ.get('PORT','8080'); app_port=os.environ.get('APP_PORT','5000'); xray_port=os.environ.get('XRAY_PORT','10000'); open(os.path.join(NGINX_DIR,'default.conf'),'w').write(f'''server {{ listen {public_port}; server_name _; location /xray/ {{ proxy_pass http://127.0.0.1:{xray_port}; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; }} location / {{ proxy_pass http://127.0.0.1:{app_port}; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Real-IP $remote_addr; }} }}\n''')
  return path
+
+def xray_validate():
+ path=os.path.join(XRAY_DIR,'config.json')
+ if not os.path.exists('/usr/local/bin/xray') and not shutil.which('xray'): return True,'xray binary unavailable in development environment'
+ try:
+  r=subprocess.run(['xray','run','-test','-config',path],capture_output=True,text=True,timeout=15)
+  return r.returncode==0,(r.stderr or r.stdout)[-1000:]
+ except Exception as e: return False,str(e)
+def xray_reload():
+ try: subprocess.run(['pkill','-HUP','-x','xray'],capture_output=True,timeout=3)
+ except Exception: pass
 
 def public_config(x):
  domain=x.get('domain') or os.environ.get('RAILWAY_PUBLIC_DOMAIN') or request.host.split(':')[0]; port=443; proto=x['protocol'].upper(); transport=x['transport'].lower(); path=x.get('path') or '/xray/'+str(x['id']); path=('/xray/'+str(x['id'])) if path=='/' and transport in ('ws','httpupgrade','xhttp') else path
@@ -71,6 +85,8 @@ def public_config(x):
  if proto=='HYSTERIA2': return f"hysteria2://{x['uuid']}@{domain}:{port}/?sni={domain}#"+x['name']
  return f"# WireGuard config for {x['name']}\\n# Endpoint: {domain}:{port}\\n# Private key: {x['uuid']}"
 
+@app.get('/health')
+def health(): return jsonify(status='ok',database=os.path.exists(DB),xray_config=os.path.exists(os.path.join(XRAY_DIR,'config.json')))
 @app.route('/')
 def index(): return render_template('index.html')
 @app.get('/api/me')
@@ -86,6 +102,9 @@ def logout(): session.clear(); return jsonify(ok=True)
 @auth
 def dashboard():
  return jsonify(users=one('SELECT COUNT(*) n FROM users')['n'],configs=one('SELECT COUNT(*) n FROM configs WHERE active=1')['n'],nodes=one('SELECT COUNT(*) n FROM nodes')['n'],subscriptions=one('SELECT COUNT(*) n FROM subscriptions')['n'],traffic=one('SELECT COALESCE(SUM(used_traffic),0) n FROM configs')['n'],recent_users=q('SELECT * FROM users ORDER BY id DESC LIMIT 5'),activities=q('SELECT * FROM activities ORDER BY id DESC LIMIT 6'),nodes_list=q('SELECT * FROM nodes ORDER BY id DESC LIMIT 5'))
+@app.get('/api/dashboard/stats')
+@auth
+def dashboard_stats(): return dashboard()
 @app.get('/api/users')
 @auth
 def users(): return jsonify(items=q('SELECT u.*,COUNT(c.id) configs,COALESCE(SUM(c.used_traffic),0) traffic FROM users u LEFT JOIN configs c ON c.user_id=u.id GROUP BY u.id ORDER BY u.id DESC'))
@@ -95,7 +114,13 @@ def add_user():
  d=request.json or {}; name=(d.get('name') or '').strip()
  if not name:return jsonify(error='نام کاربر الزامی است'),400
  c=db(); cur=c.execute('INSERT INTO users(name,note,created_at) VALUES(?,?,?)',(name,d.get('note',''),now())); uid=cur.lastrowid
- proto=d.get('protocol','VLESS').upper(); tr=d.get('transport','WS').upper(); c.execute('INSERT INTO configs(user_id,node_id,name,protocol,transport,tls,fingerprint,alpn,path,service_name,traffic_limit,connection_limit,uuid,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,d.get('node_id') or None,name,proto,tr,d.get('tls','TLS'),d.get('fingerprint','chrome'),d.get('alpn','h2,http/1.1'),d.get('path','/'),d.get('service_name',''),int(d.get('traffic_limit') or 0),int(d.get('connection_limit') or 0),str(uuid.uuid4()),now())); c.commit(); c.close(); regenerate(); log('user',f'کاربر {name} ایجاد شد'); return jsonify(ok=True)
+ proto=d.get('protocol','VLESS').upper(); tr=d.get('transport','WS').upper()
+ if proto not in {'VLESS','VMESS','TROJAN','SHADOWSOCKS'}: return jsonify(error='این Protocol در Core فعلی پشتیبانی نمی‌شود'),400
+ if tr not in {'WS','GRPC','TCP','HTTPUPGRADE','XHTTP'}: return jsonify(error='Transport نامعتبر است'),400
+ c.execute('INSERT INTO configs(user_id,node_id,name,protocol,transport,tls,fingerprint,alpn,path,service_name,traffic_limit,connection_limit,uuid,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,d.get('node_id') or None,name,proto,tr,d.get('tls','TLS'),d.get('fingerprint','chrome'),d.get('alpn','h2,http/1.1'),d.get('path','/'),d.get('service_name',''),int(d.get('traffic_limit') or 0),int(d.get('connection_limit') or 0),str(uuid.uuid4()),now())); c.commit(); c.close(); regenerate(); valid,detail=xray_validate();
+ if not valid:
+  c=db(); c.execute('UPDATE configs SET active=0 WHERE user_id=?',(uid,)); c.commit(); c.close(); log('error',f'کانفیگ کاربر {name} نامعتبر است: {detail}'); return jsonify(error='Xray configuration invalid؛ کانفیگ غیرفعال شد',detail=detail),400
+ xray_reload(); log('user',f'کاربر {name} ایجاد شد'); return jsonify(ok=True)
 @app.get('/api/configs')
 @auth
 def configs(): return jsonify(items=q('SELECT c.*,u.name user_name,n.name node_name FROM configs c JOIN users u ON u.id=c.user_id LEFT JOIN nodes n ON n.id=c.node_id ORDER BY c.id DESC'))
@@ -115,7 +140,10 @@ def config_qr(i):
 @app.patch('/api/configs/<int:i>')
 @auth
 def toggle(i):
- d=request.json or {}; c=db(); c.execute('UPDATE configs SET active=? WHERE id=?',(1 if d.get('active') else 0,i)); c.commit(); c.close(); regenerate(); log('config','وضعیت کانفیگ تغییر کرد'); return jsonify(ok=True)
+ d=request.json or {}; wanted=1 if d.get('active') else 0; c=db(); c.execute('UPDATE configs SET active=? WHERE id=?',(wanted,i)); c.commit(); c.close(); regenerate(); valid,detail=xray_validate();
+ if wanted and not valid:
+  c=db(); c.execute('UPDATE configs SET active=0 WHERE id=?',(i,)); c.commit(); c.close(); regenerate(); return jsonify(error='Xray configuration invalid؛ فعال نشد',detail=detail),400
+ xray_reload(); log('config','وضعیت کانفیگ تغییر کرد'); return jsonify(ok=True)
 @app.delete('/api/configs/<int:i>')
 @auth
 def del_config(i):
@@ -123,19 +151,36 @@ def del_config(i):
 @app.get('/api/nodes')
 @auth
 def nodes(): return jsonify(items=q('SELECT * FROM nodes ORDER BY id DESC'))
+def probe_node(host, port=443):
+ started=time.perf_counter(); ip=''
+ try:
+  ip=socket.gethostbyname(host)
+  with socket.create_connection((host,port),timeout=4): pass
+  return {'ip':ip,'reachable':True,'latency':round((time.perf_counter()-started)*1000)}
+ except Exception as e: return {'ip':ip,'reachable':False,'latency':None,'error':str(e)}
 @app.post('/api/nodes/detect')
 @auth
 def detect():
- d=request.json or {}; host=d.get('domain','').strip(); result={'domain':host,'city':'','country':'','country_code':'','location':''}
- try: result['domain']=socket.gethostbyname(host) if host else ''
- except: pass
+ d=request.json or {}; host=d.get('domain','').strip(); result={'domain':host,'city':'','country':'','country_code':'','location':'','flag':''}; probe=probe_node(host) if host else {'reachable':False,'latency':None,'ip':''}; result.update(probe)
+ try:
+  if probe.get('ip'):
+   import requests
+   geo=requests.get('https://ipwho.is/'+probe['ip'],timeout=5).json()
+   if geo.get('success'): result.update(city=geo.get('city',''),country=geo.get('country',''),country_code=geo.get('country_code',''),location=', '.join([str(geo.get('latitude','')),str(geo.get('longitude',''))]),flag=geo.get('flag',{}).get('emoji',''))
+ except Exception: pass
  return jsonify(result)
+@app.post('/api/nodes/<int:i>/check')
+@auth
+def check_node(i):
+ n=one('SELECT * FROM nodes WHERE id=?',(i,))
+ if not n:return jsonify(error='نود پیدا نشد'),404
+ p=probe_node(n['domain']); status='online' if p['reachable'] else 'offline'; c=db(); c.execute('UPDATE nodes SET status=?,latency=?,last_check=? WHERE id=?',(status,p.get('latency'),now(),i)); c.commit(); c.close(); log('node',f'بررسی نود {n["name"]}: {status}'); return jsonify(status=status,latency=p.get('latency'),ip=p.get('ip'))
 @app.post('/api/nodes')
 @auth
 def add_node():
  d=request.json or {}; name=d.get('name','').strip(); domain=d.get('domain','').strip()
  if not name or not domain:return jsonify(error='نام و دامنه الزامی است'),400
- c=db(); c.execute('INSERT INTO nodes(name,domain,city,country,country_code,location,status,last_check,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(name,domain,d.get('city',''),d.get('country',''),d.get('country_code',''),d.get('location',''),'online',now(),now())); c.commit(); c.close(); log('node',f'سرور {name} اضافه شد'); return jsonify(ok=True)
+ probe=probe_node(domain); status='online' if probe['reachable'] else 'offline'; c=db(); c.execute('INSERT INTO nodes(name,domain,city,country,country_code,location,status,latency,last_check,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(name,domain,d.get('city',''),d.get('country',''),d.get('country_code',''),d.get('location',''),status,probe.get('latency'),now(),now())); c.commit(); c.close(); log('node',f'سرور {name} اضافه شد؛ وضعیت {status}'); return jsonify(ok=True,status=status)
 @app.delete('/api/nodes/<int:i>')
 @auth
 def del_node(i):
