@@ -1,7 +1,9 @@
 import os, sqlite3, json, uuid, secrets, socket, subprocess, time
 from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, request, jsonify, session, send_from_directory, render_template, abort
+from flask import Flask, request, jsonify, session, send_from_directory, render_template, abort, send_file
+from io import BytesIO
+import base64
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE=os.path.dirname(os.path.abspath(__file__)); DATA=os.environ.get('DATA_DIR','/app/data')
@@ -49,7 +51,7 @@ def regenerate():
   elif proto=='trojan': settings={'clients':[{'password':x['uuid'],'email':x['name']}],'fallbacks':[]}
   elif proto=='shadowsocks': settings={'clients':[{'password':x['uuid'],'email':x['name']}],'method':'2022-blake3-aes-128-gcm'}
   else: settings={'clients':[{'password':x['uuid'],'email':x['name']}]}
-  stream={'network': {'httpupgrade':'httpupgrade','xhttp':'xhttp'}.get(x['transport'].lower(),x['transport'].lower()),'security':x['tls'] or 'none'}
+  stream={'network': {'httpupgrade':'httpupgrade','xhttp':'xhttp'}.get(x['transport'].lower(),x['transport'].lower()),'security':'none'}
   if stream['network'] in ('ws','httpupgrade','xhttp'): stream['sockopt']={'tcpFastOpen':True}
   inbound={'tag':'titan-'+str(x['id']),'port':int(os.environ.get('XRAY_PORT','10000')),'listen':'127.0.0.1','protocol':proto,'settings':settings,'streamSettings':stream}
   if stream['network'] in ('ws','httpupgrade','xhttp'): stream['wsSettings']={'path':'/xray/'+str(x['id'])}
@@ -60,7 +62,14 @@ def regenerate():
  return path
 
 def public_config(x):
- domain=x.get('domain') or os.environ.get('RAILWAY_PUBLIC_DOMAIN','localhost'); scheme='vless' if x['protocol']=='VLESS' else x['protocol'].lower(); return f"{scheme}://{x['uuid']}@{domain}:443?type={x['transport'].lower()}&security={x['tls'] or 'none'}&path={x['path'] or '/'}#{x['name']}"
+ domain=x.get('domain') or os.environ.get('RAILWAY_PUBLIC_DOMAIN') or request.host.split(':')[0]; port=443; proto=x['protocol'].upper(); transport=x['transport'].lower(); path=x.get('path') or '/xray/'+str(x['id']); path=('/xray/'+str(x['id'])) if path=='/' and transport in ('ws','httpupgrade','xhttp') else path
+ if proto=='VLESS': return f"vless://{x['uuid']}@{domain}:{port}?encryption=none&security=tls&type={transport}&host={domain}&path={path}#{x['name']}"
+ if proto=='VMESS':
+  raw=json.dumps({'v':'2','ps':x['name'],'add':domain,'port':str(port),'id':x['uuid'],'aid':'0','scy':'auto','net':transport,'type':'none','host':domain,'path':path,'tls':'tls'},separators=(',',':')); return 'vmess://'+base64.b64encode(raw.encode()).decode()
+ if proto=='TROJAN': return f"trojan://{x['uuid']}@{domain}:{port}?security=tls&type={transport}&host={domain}&path={path}#{x['name']}"
+ if proto=='SHADOWSOCKS': return 'ss://'+base64.b64encode(f"2022-blake3-aes-128-gcm:{x['uuid']}@{domain}:{port}".encode()).decode()+'#'+x['name']
+ if proto=='HYSTERIA2': return f"hysteria2://{x['uuid']}@{domain}:{port}/?sni={domain}#"+x['name']
+ return f"# WireGuard config for {x['name']}\\n# Endpoint: {domain}:{port}\\n# Private key: {x['uuid']}"
 
 @app.route('/')
 def index(): return render_template('index.html')
@@ -90,6 +99,19 @@ def add_user():
 @app.get('/api/configs')
 @auth
 def configs(): return jsonify(items=q('SELECT c.*,u.name user_name,n.name node_name FROM configs c JOIN users u ON u.id=c.user_id LEFT JOIN nodes n ON n.id=c.node_id ORDER BY c.id DESC'))
+@app.get('/api/configs/<int:i>/link')
+@auth
+def config_link(i):
+ x=one('SELECT c.*,n.domain FROM configs c LEFT JOIN nodes n ON n.id=c.node_id WHERE c.id=?',(i,))
+ if not x:return jsonify(error='کانفیگ پیدا نشد'),404
+ return jsonify(link=public_config(x))
+@app.get('/api/configs/<int:i>/qr')
+@auth
+def config_qr(i):
+ import qrcode
+ x=one('SELECT c.*,n.domain FROM configs c LEFT JOIN nodes n ON n.id=c.node_id WHERE c.id=?',(i,))
+ if not x: return jsonify(error='کانفیگ پیدا نشد'),404
+ img=qrcode.make(public_config(x)); out=BytesIO(); img.save(out,format='PNG'); out.seek(0); return send_file(out,mimetype='image/png',download_name='titan-config-'+str(i)+'.png')
 @app.patch('/api/configs/<int:i>')
 @auth
 def toggle(i):

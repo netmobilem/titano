@@ -1,6 +1,6 @@
 FROM python:3.12-slim AS runtime
 ARG XRAY_VERSION=26.9.30
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DATA_DIR=/app/data APP_PORT=5000 XRAY_PORT=10000
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DATA_DIR=/app/data APP_PORT=5000 XRAY_PORT=10000 PORT=8080
 RUN apt-get update && apt-get install -y --no-install-recommends nginx ca-certificates curl unzip tini && rm -rf /var/lib/apt/lists/* \
     && arch="$(dpkg --print-architecture)" \
     && case "$arch" in amd64) xarch=64;; arm64) xarch=arm64-v8a;; *) echo "Unsupported architecture: $arch"; exit 1;; esac \

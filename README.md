@@ -23,14 +23,14 @@ admin / admin123
 3. Railway به‌صورت خودکار Dockerfile را build می‌کند.
 4. در Service → Volumes یک Volume بسازید و Mount Path را دقیقاً بگذارید:
    `/app/data`
-5. در Variables این موارد را تنظیم کنید:
-```env
+5. هیچ Variable اجباری برای اجرای اولیه لازم نیست. Dockerfile به‌صورت پیش‌فرض از این مقادیر استفاده می‌کند:
+```text
 DATA_DIR=/app/data
-ADMIN_PASSWORD=یک-رمز-قوی-حداقل-۸-کاراکتر
-SECRET_KEY=یک-رشته-تصادفی-طولانی
+PORT=8080
 APP_PORT=5000
 XRAY_PORT=10000
 ```
+در صورت نیاز به امنیت بیشتر، می‌توانی بعداً `ADMIN_PASSWORD` و `SECRET_KEY` را اضافه کنی، اما Deploy بدون آن‌ها نیز انجام می‌شود.
 6. از Settings → Networking یک Public Domain بسازید.
 
 برنامه فقط یک Service است و داخل آن این فرآیندها مدیریت می‌شوند:
